@@ -49,7 +49,6 @@ Explorer       = 1185  # 探検家の先導
 # Precompute attack IDs for Soubureizu ex
 _atk_id = {a.name: a.attackId for a in all_attack()}
 ATK_SINHOMURA = _atk_id.get("しんえんほむら", -1)   # 1 fire, 30 + 20×trash fire
-ATK_AMETHYST  = _atk_id.get("アメジストレイジ", -1)  # 2 fire, 180
 
 
 class AttackPlan:
@@ -103,16 +102,6 @@ def sinhomura_damage(trash_fire: int, target: Pokemon) -> int:
     data = card_table[target.id]
     if data.weakness == EnergyType.FIRE:
         damage *= 2
-    return damage
-
-
-def amethyst_damage(target: Pokemon) -> int:
-    damage = 180
-    data = card_table[target.id]
-    if data.weakness == EnergyType.FIRE:
-        damage *= 2
-    elif data.resistance == EnergyType.FIRE:
-        damage -= 30
     return damage
 
 
@@ -183,24 +172,17 @@ def agent(obs_dict: dict) -> list[int]:
 
             energy_count = len(my_pokemon.energies)
 
-            for a in range(2):
-                if a == 0:
-                    energy_required = 1
-                    damage_fn = lambda t: sinhomura_damage(trash_fire, t)
-                else:
-                    energy_required = 2
-                    damage_fn = amethyst_damage
+            energy_required = 1
+            damage_fn = lambda t: sinhomura_damage(trash_fire, t)
 
-                ec = energy_count
-                more_energy = False
-                if ec < energy_required:
-                    if hand_counts[Fire_Energy] >= 1 and not state.energyAttached:
-                        ec += 1
-                        if ec < energy_required:
-                            continue
-                        more_energy = True
-                    else:
-                        continue
+            ec = energy_count
+            more_energy = False
+            if ec < energy_required:
+                if hand_counts[Fire_Energy] >= 1 and not state.energyAttached:
+                    ec += 1
+                    more_energy = True
+                else:
+                    continue
 
                 for j, op_pokemon in enumerate(op_cards):
                     if j != 0 and not can_op_switch:
@@ -220,7 +202,7 @@ def agent(obs_dict: dict) -> list[int]:
                         best_score        = score
                         plan.attacker     = i
                         plan.target       = j
-                        plan.attack_index = a
+                        plan.attack_index = 0
                         plan.remain_hp    = op_pokemon.hp - damage
                         plan.energy       = more_energy
 
@@ -376,12 +358,8 @@ def agent(obs_dict: dict) -> list[int]:
 
         elif o.type == OptionType.ATTACK:
             score = 1000
-            if plan.attack_index == 1:
-                if o.attackId == ATK_AMETHYST:
-                    score += 100
-            else:
-                if o.attackId == ATK_SINHOMURA:
-                    score += 100
+            if o.attackId == ATK_SINHOMURA:
+                score += 100
 
         scores.append(score)
 
