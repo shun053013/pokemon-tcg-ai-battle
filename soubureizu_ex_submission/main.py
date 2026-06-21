@@ -59,8 +59,9 @@ class AttackPlan:
     energy       = False  # True if energy attachment is still needed
 
 
-plan     = AttackPlan()
-pre_turn = 0
+plan             = AttackPlan()
+pre_turn         = 0
+op_attacker_ids: set = set()  # 対戦中に相手アクティブに出てきたポケモンのカードID
 
 
 def get_card(obs: Observation, area: AreaType, index: int, player_index: int) -> Pokemon | Card | None:
@@ -125,10 +126,13 @@ def agent(obs_dict: dict) -> list[int]:
     my_state = state.players[my_index]
     op_state = state.players[1 - my_index]
 
-    global plan, pre_turn
+    global plan, pre_turn, op_attacker_ids
     if pre_turn != state.turn:
         pre_turn = state.turn
         plan     = AttackPlan()
+        # 相手アクティブのポケモンをアタッカー履歴に記録（エネルギーを持っていれば攻撃可能と判断）
+        if op_state.active and op_state.active[0] is not None and len(op_state.active[0].energies) >= 1:
+            op_attacker_ids.add(op_state.active[0].id)
 
     field_counts   = defaultdict(int)
     hand_counts    = defaultdict(int)
@@ -184,27 +188,58 @@ def agent(obs_dict: dict) -> list[int]:
                 else:
                     continue
 
-                for j, op_pokemon in enumerate(op_cards):
-                    if j != 0 and not can_op_switch:
-                        break
-                    damage = damage_fn(op_pokemon)
-                    score  = prize_count(op_pokemon) * 1000
-                    if len(op_state.prize) <= prize_count(op_pokemon) and op_pokemon.hp <= damage:
-                        score = 50000
-                    elif op_pokemon.hp <= damage:
-                        score += 2000
-                    else:
-                        score += int(1000 * damage / op_pokemon.hp)
-                    score += 300 if j == 0 else 0
-                    score += 200 if i == 0 else 0
+            for j, op_pokemon in enumerate(op_cards):
+                if j != 0 and not can_op_switch:
+                    break
+                damage = damage_fn(op_pokemon)
+                score  = prize_count(op_pokemon) * 1000
+                if len(op_state.prize) <= prize_count(op_pokemon) and op_pokemon.hp <= damage:
+                    score = 50000
+                elif op_pokemon.hp <= damage:
+                    score += 2000
+                else:
+                    score += int(1000 * damage / op_pokemon.hp)
+                score += 300 if j == 0 else 0
+                score += 200 if i == 0 else 0
 
-                    if best_score < score:
+                if best_score < score:
+                    best_score        = score
+                    plan.attacker     = i
+                    plan.target       = j
+                    plan.attack_index = 0
+                    plan.remain_hp    = op_pokemon.hp - damage
+                    plan.energy       = more_energy
+
+        # バトル場がOHKOできない場合、エネルギー持ちの非exアタッカーをベンチから呼び出す
+        if (can_op_switch
+                and plan.attacker >= 0
+                and plan.target == 0
+                and plan.remain_hp > 0):
+            my_attacker = my_cards[plan.attacker] if plan.attacker < len(my_cards) else None
+            ec_now = len(my_attacker.energies) if my_attacker else 0
+            can_still_attack = ec_now >= 1 or (hand_counts[Fire_Energy] >= 1 and not state.energyAttached)
+            if can_still_attack:
+                for j, op_pokemon in enumerate(op_cards):
+                    if j == 0:
+                        continue
+                    if op_pokemon.id not in op_attacker_ids:
+                        continue
+                    if len(op_pokemon.energies) == 0:
+                        continue
+                    data = card_table[op_pokemon.id]
+                    if data.ex:
+                        continue  # exは上のループで処理済み
+                    damage = sinhomura_damage(trash_fire, op_pokemon)
+                    score  = int(1000 * damage / op_pokemon.hp) + len(op_pokemon.energies) * 100 + 600
+                    if op_pokemon.hp <= damage:
+                        score += 2000
+                    if score > best_score:
                         best_score        = score
-                        plan.attacker     = i
+                        plan.attacker     = 0
                         plan.target       = j
                         plan.attack_index = 0
                         plan.remain_hp    = op_pokemon.hp - damage
-                        plan.energy       = more_energy
+                        plan.energy       = ec_now < 1
 
     # Energy attachment priority score
     def energy_score(pokemon: Pokemon, active: bool) -> int:
@@ -285,12 +320,16 @@ def agent(obs_dict: dict) -> list[int]:
                             score = 50
 
                 elif context == SelectContext.EFFECT_TARGET:
-                    # Boss Orders: target opponent's bench — prefer OHKOable ex
+                    # Boss Orders: exまたは既知の非exアタッカーをベンチから呼び出す
                     if isinstance(card, Pokemon) and o.playerIndex != my_index:
                         data = card_table[card.id]
                         if data.ex:
                             dmg = sinhomura_damage(trash_fire, card)
                             score = 1000 if card.hp <= dmg else 500 + dmg
+                        elif card.id in op_attacker_ids and len(card.energies) >= 1:
+                            # 対戦中に攻撃してきた非exアタッカー（エネルギー持ち）
+                            dmg = sinhomura_damage(trash_fire, card)
+                            score = 900 if card.hp <= dmg else 400 + dmg
                         else:
                             score = 100
 
