@@ -154,6 +154,11 @@ def agent(obs_dict: dict) -> list[int]:
         discard_counts[card.id] += 1
 
     trash_fire = discard_counts[Fire_Energy]
+
+    # ドロー用サポートをトラッシュしないべき状況：ベンチ未展開 or 炎エネが手札にない
+    bench_not_setup = (field_counts[Charcadet] + field_counts[Soubureizu_ex]) < 3
+    need_draw = bench_not_setup or hand_counts[Fire_Energy] == 0
+
     my_active  = my_state.active[0] if my_state.active else None
     op_active  = op_state.active[0] if op_state.active else None
     my_cards   = ([my_active] if my_active is not None else []) + [p for p in my_state.bench if p is not None]
@@ -323,8 +328,8 @@ def agent(obs_dict: dict) -> list[int]:
 
                 elif context == SelectContext.DISCARD:
                     if o.area == AreaType.DECK:
-                        # Perfect Mixer: prefer trashing Fire Energy from deck
-                        score = 200 if card.id == Fire_Energy else 50
+                        # Perfect Mixer: 炎エネルギーのみトラッシュ、それ以外はデッキに戻す
+                        score = 200 if card.id == Fire_Energy else -200
                     else:
                         is_pyur = select.effect is not None and select.effect.id == Pyur
                         if card.id == Fire_Energy:
@@ -335,6 +340,9 @@ def agent(obs_dict: dict) -> list[int]:
                             score = -50
                         elif card.id == Boss_Orders:
                             score = -30
+                        elif card.id in (Lillie, Zeigh, Pyur):
+                            # ベンチ未展開またはエネルギーが手札にない場合はドロー系サポートを温存
+                            score = -100 if need_draw else 50
                         elif is_pyur and card.id in PYUR_DISCARD_GOODS:
                             # ピュール: 展開用グッズを炎エネに次いで優先トラッシュ
                             score = 150
@@ -384,7 +392,7 @@ def agent(obs_dict: dict) -> list[int]:
                     has_trash = any(c.id in (Charcadet, Soubureizu_ex) for c in my_state.discard)
                     score = 7000 if has_trash else -1
                 elif card.id == Perfect_Mixer:
-                    score = 6000 if trash_fire < 6 and state.players[my_index].deckCount >= 5 else -1
+                    score = 9900 if my_state.deckCount >= 1 else -1
                 elif card.id == Boss_Orders:
                     score = 3200 if plan.target >= 1 else -1
                 elif card.id == Explorer:
@@ -419,14 +427,18 @@ def agent(obs_dict: dict) -> list[int]:
                 score += 200
 
         elif o.type == OptionType.EVOLVE:
-            pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
-            score   = 9000 + len(pokemon.energies)
+            pokemon  = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
+            evo_card = get_card(obs, AreaType.HAND, o.index, my_index)
+            if evo_card is not None and evo_card.id == Soubureizu_ex:
+                score = 10000 + len(pokemon.energies)  # ソウブレイズexへの進化は最高優先
+            else:
+                score = 9000 + len(pokemon.energies)
 
         elif o.type == OptionType.RETREAT:
             active_is_charcadet = my_active is not None and my_active.id == Charcadet
             soubureizu_on_bench = any(p is not None and p.id == Soubureizu_ex for p in my_state.bench)
             if active_is_charcadet and soubureizu_on_bench:
-                score = 5000  # ソウブレイズexをバトル場に出すため最優先で退場
+                score = 9800  # アイテム(最大9500)より高くして即座に退場を確定
             elif plan.attacker >= 1:
                 score = 2000
             else:
