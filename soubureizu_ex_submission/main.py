@@ -45,6 +45,10 @@ Boss_Orders    = 1182  # ボスの指令
 Lillie         = 1227  # リーリエの決心
 Zeigh          = 1192  # ゼイユ
 Explorer       = 1185  # 探検家の先導
+Pyur           = 1239  # ピュール（任意枚手札トラッシュ→手札5枚になるよう引く）
+
+# ピュールでトラッシュしたいグッズ（ポケモン展開用、夜のタンカは除く）
+PYUR_DISCARD_GOODS = (Poke_Poffin, Hyperball, Poke_Pad, Perfect_Mixer)
 
 # Precompute attack IDs for Soubureizu ex
 _atk_id = {a.name: a.attackId for a in all_attack()}
@@ -309,13 +313,18 @@ def agent(obs_dict: dict) -> list[int]:
                         # Perfect Mixer: prefer trashing Fire Energy from deck
                         score = 200 if card.id == Fire_Energy else 50
                     else:
-                        # Hyperball cost etc.: prefer trashing Fire Energy from hand
+                        is_pyur = select.effect is not None and select.effect.id == Pyur
                         if card.id == Fire_Energy:
                             score = 200
                         elif card.id in (Charcadet, Soubureizu_ex):
                             score = -100
-                        elif card.id in (Boss_Orders, Explorer, Night_Stretcher):
+                        elif card.id in (Explorer, Night_Stretcher):
                             score = -50
+                        elif card.id == Boss_Orders:
+                            score = -30
+                        elif is_pyur and card.id in PYUR_DISCARD_GOODS:
+                            # ピュール: 展開用グッズを炎エネに次いで優先トラッシュ
+                            score = 150
                         else:
                             score = 50
 
@@ -367,6 +376,14 @@ def agent(obs_dict: dict) -> list[int]:
                     score = 3200 if plan.target >= 1 else -1
                 elif card.id == Explorer:
                     score = 3100
+                elif card.id == Pyur:
+                    # 炎エネルギーが多いほど高優先度（捨てて手札補充）
+                    if hand_counts[Fire_Energy] >= 2:
+                        score = 2800
+                    elif hand_counts[Fire_Energy] >= 1 or sum(1 for c in my_state.hand if c.id in PYUR_DISCARD_GOODS) >= 2:
+                        score = 2500
+                    else:
+                        score = 2000
                 elif card.id == Lillie:
                     score = 3000 if len(my_state.hand) <= 4 else 1000
                 elif card.id == Zeigh:
