@@ -1,0 +1,390 @@
+%%writefile main.py
+import os
+import sys
+from collections import defaultdict
+
+if not os.path.exists("cg"):
+    sys.path.insert(0, "/kaggle_simulations/agent")
+
+from cg.api import (
+    AreaType, CardType, EnergyType, Observation, SelectContext, OptionType,
+    Card, Pokemon, all_attack, all_card_data, to_observation_class,
+)
+
+"""
+Soubureizu ex Deck
+This deck burns through Fire Energy in the discard pile to power up しんえんほむら.
+"""
+
+# Load deck.csv in the dataset
+file_path = "deck.csv"
+if not os.path.exists(file_path):
+    file_path = "/kaggle_simulations/agent/" + file_path
+with open(file_path, "r") as file:
+    csv = file.read().split("\n")
+my_deck = []
+for i in range(60):
+    my_deck.append(int(csv[i]))
+
+# Fetch card metadata database and create an ID-to-Card lookup table
+all_card = all_card_data()
+card_table = {c.cardId: c for c in all_card}
+
+# Decklist
+Charcadet      = 319   # カルボウ
+Soubureizu_ex  = 320   # ソウブレイズex
+Fire_Energy    = 2     # 基本炎エネルギー
+
+Hyperball      = 1121  # ハイパーボール
+Poke_Pad       = 1152  # ポケパッド
+Night_Stretcher = 1097  # 夜のタンカ
+Poke_Poffin    = 1086  # なかよしポフィン
+Perfect_Mixer  = 1128  # パーフェクトミキサー
+
+Boss_Orders    = 1182  # ボスの指令
+Lillie         = 1227  # リーリエの決心
+Zeigh          = 1192  # ゼイユ
+Explorer       = 1185  # 探検家の先導
+
+# Precompute attack IDs for Soubureizu ex
+_atk_id = {a.name: a.attackId for a in all_attack()}
+ATK_SINHOMURA = _atk_id.get("しんえんほむら", -1)   # 1 fire, 30 + 20×trash fire
+ATK_AMETHYST  = _atk_id.get("アメジストレイジ", -1)  # 2 fire, 180
+
+
+class AttackPlan:
+    attacker     = -1   # index in my_cards (0=active, 1+=bench)
+    target       = -1   # index in op_cards
+    attack_index = -1   # 0=しんえんほむら, 1=アメジストレイジ
+    remain_hp    = -1
+    energy       = False  # True if energy attachment is still needed
+
+
+plan     = AttackPlan()
+pre_turn = 0
+
+
+def get_card(obs: Observation, area: AreaType, index: int, player_index: int) -> Pokemon | Card | None:
+    """Helper function to safely extract a Card or Pokemon object from specific zones."""
+    ps = obs.current.players[player_index]
+    match area:
+        case AreaType.DECK:
+            return obs.select.deck[index]
+        case AreaType.HAND:
+            return ps.hand[index]
+        case AreaType.DISCARD:
+            return ps.discard[index]
+        case AreaType.ACTIVE:
+            return ps.active[index]
+        case AreaType.BENCH:
+            return ps.bench[index]
+        case AreaType.PRIZE:
+            return ps.prize[index]
+        case AreaType.STADIUM:
+            return obs.current.stadium[index]
+        case AreaType.LOOKING:
+            return obs.current.looking[index]
+        case _:
+            return None
+
+
+def prize_count(pokemon: Pokemon) -> int:
+    """Calculates how many Prize cards a Pokémon yields upon being Knocked Out."""
+    data = card_table[pokemon.id]
+    count = 3 if data.megaEx else 2 if data.ex else 1
+    for card in pokemon.energyCards:
+        if card.id == 12:  # Legacy Energy
+            count -= 1
+    return max(0, count)
+
+
+def sinhomura_damage(trash_fire: int, target: Pokemon) -> int:
+    damage = 30 + trash_fire * 20
+    data = card_table[target.id]
+    if data.weakness == EnergyType.FIRE:
+        damage *= 2
+    return damage
+
+
+def amethyst_damage(target: Pokemon) -> int:
+    damage = 180
+    data = card_table[target.id]
+    if data.weakness == EnergyType.FIRE:
+        damage *= 2
+    elif data.resistance == EnergyType.FIRE:
+        damage -= 30
+    return damage
+
+
+def agent(obs_dict: dict) -> list[int]:
+    """Main Agent Function.
+
+    Each element in the returned list must be >= 0 and < len(obs.select.option).
+    The list length must be between obs.select.minCount and obs.select.maxCount (inclusive), with no duplicate elements.
+
+    Returns:
+        list[int]: A list of option index.
+    """
+    obs = to_observation_class(obs_dict)
+    if obs.select is None:
+        return my_deck
+
+    state   = obs.current
+    select  = obs.select
+    context = select.context
+    my_index = state.yourIndex
+    my_state = state.players[my_index]
+    op_state = state.players[1 - my_index]
+
+    global plan, pre_turn
+    if pre_turn != state.turn:
+        pre_turn = state.turn
+        plan     = AttackPlan()
+
+    field_counts   = defaultdict(int)
+    hand_counts    = defaultdict(int)
+    discard_counts = defaultdict(int)
+
+    for card in my_state.active + my_state.bench:
+        if card is None:
+            continue
+        field_counts[card.id] += 1
+
+    for card in my_state.hand:
+        hand_counts[card.id] += 1
+
+    for card in my_state.discard:
+        discard_counts[card.id] += 1
+
+    trash_fire = discard_counts[Fire_Energy]
+    my_active  = my_state.active[0] if my_state.active else None
+    op_active  = op_state.active[0] if op_state.active else None
+    my_cards   = ([my_active] if my_active is not None else []) + [p for p in my_state.bench if p is not None]
+    op_cards   = ([op_active] if op_active is not None else []) + [p for p in op_state.bench  if p is not None]
+
+    # Compute attack plan in MAIN context
+    if context == SelectContext.MAIN and state.turn >= 2:
+        can_switch    = False
+        can_op_switch = False
+        for o in select.option:
+            if o.type == OptionType.PLAY:
+                card = get_card(obs, AreaType.HAND, o.index, my_index)
+                if card.id == Boss_Orders:
+                    can_op_switch = True
+            elif o.type == OptionType.RETREAT:
+                can_switch = True
+
+        best_score = -1
+        for i, my_pokemon in enumerate(my_cards):
+            if i != 0 and not can_switch:
+                continue
+            if my_pokemon.id != Soubureizu_ex:
+                continue
+
+            energy_count = len(my_pokemon.energies)
+
+            for a in range(2):
+                if a == 0:
+                    energy_required = 1
+                    damage_fn = lambda t: sinhomura_damage(trash_fire, t)
+                else:
+                    energy_required = 2
+                    damage_fn = amethyst_damage
+
+                ec = energy_count
+                more_energy = False
+                if ec < energy_required:
+                    if hand_counts[Fire_Energy] >= 1 and not state.energyAttached:
+                        ec += 1
+                        if ec < energy_required:
+                            continue
+                        more_energy = True
+                    else:
+                        continue
+
+                for j, op_pokemon in enumerate(op_cards):
+                    if j != 0 and not can_op_switch:
+                        break
+                    damage = damage_fn(op_pokemon)
+                    score  = prize_count(op_pokemon) * 1000
+                    if len(op_state.prize) <= prize_count(op_pokemon) and op_pokemon.hp <= damage:
+                        score = 50000
+                    elif op_pokemon.hp <= damage:
+                        score += 2000
+                    else:
+                        score += int(1000 * damage / op_pokemon.hp)
+                    score += 300 if j == 0 else 0
+                    score += 200 if i == 0 else 0
+
+                    if best_score < score:
+                        best_score        = score
+                        plan.attacker     = i
+                        plan.target       = j
+                        plan.attack_index = a
+                        plan.remain_hp    = op_pokemon.hp - damage
+                        plan.energy       = more_energy
+
+    # Energy attachment priority score
+    def energy_score(pokemon: Pokemon, active: bool) -> int:
+        count = len(pokemon.energies)
+        if pokemon.id == Soubureizu_ex:
+            return 8000 + (10 if active else 0) + (100 if count < 2 else 0)
+        if pokemon.id == Charcadet:
+            return 3000
+        return 500
+
+    # Iterate over every possible option and assign a heuristic score
+    scores = []
+    for o in select.option:
+        score = 0
+
+        if o.type == OptionType.NUMBER:
+            score = o.number
+
+        elif o.type == OptionType.YES:
+            score = 1
+
+        elif o.type == OptionType.CARD:
+            card = get_card(obs, o.area, o.index, o.playerIndex)
+            if card is not None:
+                energy_count = len(card.energies) if isinstance(card, Pokemon) else 0
+
+                if context in (SelectContext.SWITCH, SelectContext.TO_ACTIVE):
+                    if o.playerIndex == my_index:
+                        if card.id == Soubureizu_ex:
+                            score = 100 + energy_count
+                        elif card.id == Charcadet:
+                            score = 50 + energy_count
+                        if plan.attacker > 0 and o.area == AreaType.BENCH and o.index == plan.attacker - 1:
+                            score += 200
+                    else:
+                        if plan.target > 0 and o.index == plan.target - 1:
+                            score += 200
+
+                elif context == SelectContext.SETUP_ACTIVE_POKEMON:
+                    if card.id == Charcadet:
+                        score = 10
+                    elif card.id == Soubureizu_ex:
+                        score = 5
+
+                elif context == SelectContext.SETUP_BENCH_POKEMON:
+                    score = 10 if card.id == Charcadet else 1
+
+                elif context == SelectContext.TO_HAND:
+                    score = 200 - hand_counts[card.id] * 50
+                    if card.id == Charcadet:
+                        score += 50 if field_counts[Charcadet] + field_counts[Soubureizu_ex] < 2 else -50
+                    elif card.id == Soubureizu_ex:
+                        score += 80 if field_counts[Soubureizu_ex] < 1 else -100
+                    elif card.id == Fire_Energy:
+                        score -= 100  # keep fire energy in discard for damage boost
+                    elif card.id in (Boss_Orders, Zeigh, Lillie, Explorer, Poke_Pad):
+                        score += 30
+
+                elif context == SelectContext.ATTACH_FROM:
+                    score = energy_score(card, o.area == AreaType.ACTIVE)
+
+                elif context in (SelectContext.TO_BENCH, SelectContext.TO_FIELD):
+                    score = 100 if card.id == Charcadet else 80 if card.id == Soubureizu_ex else 10
+
+                elif context == SelectContext.DISCARD:
+                    if o.area == AreaType.DECK:
+                        # Perfect Mixer: prefer trashing Fire Energy from deck
+                        score = 200 if card.id == Fire_Energy else 50
+                    else:
+                        # Hyperball cost etc.: prefer trashing Fire Energy from hand
+                        if card.id == Fire_Energy:
+                            score = 200
+                        elif card.id in (Charcadet, Soubureizu_ex):
+                            score = -100
+                        elif card.id in (Boss_Orders, Explorer, Night_Stretcher):
+                            score = -50
+                        else:
+                            score = 50
+
+                elif context == SelectContext.EFFECT_TARGET:
+                    # Boss Orders: target opponent's bench — prefer OHKOable ex
+                    if isinstance(card, Pokemon) and o.playerIndex != my_index:
+                        data = card_table[card.id]
+                        if data.ex:
+                            dmg = sinhomura_damage(trash_fire, card)
+                            score = 1000 if card.hp <= dmg else 500 + dmg
+                        else:
+                            score = 100
+
+                elif context in (SelectContext.TO_DECK, SelectContext.TO_DECK_ENERGY):
+                    score = -100 if card.id == Fire_Energy else 100
+
+                elif context in (SelectContext.DAMAGE_COUNTER, SelectContext.DAMAGE_COUNTER_ANY):
+                    score = 100
+
+        elif o.type == OptionType.PLAY:
+            card = get_card(obs, AreaType.HAND, o.index, my_index)
+            data = card_table[card.id]
+            if data.cardType == CardType.POKEMON:
+                score = 20000
+                charcadet_field = field_counts[Charcadet] + field_counts[Soubureizu_ex]
+                bench_full = len(my_state.bench) >= my_state.benchMax
+                if bench_full or charcadet_field >= 4:
+                    score = -1
+            else:
+                score = 10000
+                if card.id == Poke_Poffin:
+                    charcadet_field = field_counts[Charcadet] + field_counts[Soubureizu_ex]
+                    bench_full = len(my_state.bench) >= my_state.benchMax
+                    score = 9500 if not bench_full and charcadet_field < 4 else -1
+                elif card.id == Hyperball:
+                    score = 8500 if len(my_state.hand) >= 3 and field_counts[Soubureizu_ex] < 2 else -1
+                elif card.id == Poke_Pad:
+                    score = 8000 if not (field_counts[Charcadet] >= 1 or hand_counts[Charcadet] >= 1) else -1
+                elif card.id == Night_Stretcher:
+                    has_trash = any(c.id in (Charcadet, Soubureizu_ex) for c in my_state.discard)
+                    score = 7000 if has_trash else -1
+                elif card.id == Perfect_Mixer:
+                    score = 6000 if trash_fire < 6 and state.players[my_index].deckCount >= 5 else -1
+                elif card.id == Boss_Orders:
+                    score = 3200 if plan.target >= 1 else -1
+                elif card.id == Explorer:
+                    score = 3100
+                elif card.id == Lillie:
+                    score = 3000 if len(my_state.hand) <= 4 else 1000
+                elif card.id == Zeigh:
+                    is_first_turn = state.turn == 1 and state.firstPlayer == my_index
+                    if is_first_turn:
+                        score = 3500
+                    elif hand_counts[Fire_Energy] >= 3:
+                        score = 2500
+                    elif len(my_state.hand) >= 6:
+                        score = 2000
+                    else:
+                        score = 1500
+
+        elif o.type == OptionType.ATTACH:
+            pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
+            score   = energy_score(pokemon, o.inPlayArea == AreaType.ACTIVE)
+            if o.inPlayArea == AreaType.ACTIVE and plan.attacker == 0 and plan.energy:
+                score += 200
+            elif o.inPlayArea == AreaType.BENCH and plan.attacker == 1 + o.inPlayIndex and plan.energy:
+                score += 200
+
+        elif o.type == OptionType.EVOLVE:
+            pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
+            score   = 9000 + len(pokemon.energies)
+
+        elif o.type == OptionType.RETREAT:
+            score = 2000 if plan.attacker >= 1 else -1
+
+        elif o.type == OptionType.ATTACK:
+            score = 1000
+            if plan.attack_index == 1:
+                if o.attackId == ATK_AMETHYST:
+                    score += 100
+            else:
+                if o.attackId == ATK_SINHOMURA:
+                    score += 100
+
+        scores.append(score)
+
+    # Select in descending order of score
+    desc_indices = [i for i, _ in sorted(enumerate(scores), key=lambda x: x[1], reverse=True)]
+    return desc_indices[:select.maxCount]
