@@ -248,10 +248,23 @@ def agent(obs_dict: dict) -> list[int]:
     # Energy attachment priority score
     def energy_score(pokemon: Pokemon, active: bool) -> int:
         count = len(pokemon.energies)
+        soubureizu_on_bench = any(p is not None and p.id == Soubureizu_ex for p in my_state.bench)
+        active_is_charcadet = my_active is not None and my_active.id == Charcadet
+
+        # アクティブがカルボウ＋ソウブレイズexがベンチにいる場合：
+        # カルボウにエネルギーをつけて逃げられるようにする（進化できない場合優先）
+        if pokemon.id == Charcadet and active and active_is_charcadet and soubureizu_on_bench and count == 0:
+            can_evolve = hand_counts[Soubureizu_ex] > 0
+            return 8800 if not can_evolve else 3000
+
+        # ソウブレイズexはエネルギー1枚だけ（しんえんほむらに必要な最小限）
         if pokemon.id == Soubureizu_ex:
-            return 8000 + (10 if active else 0) + (100 if count < 2 else 0)
+            if count >= 1:
+                return 50   # すでに1枚あるので追加しない
+            return 8000 + (10 if active else 0)
+
         if pokemon.id == Charcadet:
-            return 3000
+            return 1000
         return 500
 
     # Iterate over every possible option and assign a heuristic score
@@ -410,7 +423,14 @@ def agent(obs_dict: dict) -> list[int]:
             score   = 9000 + len(pokemon.energies)
 
         elif o.type == OptionType.RETREAT:
-            score = 2000 if plan.attacker >= 1 else -1
+            active_is_charcadet = my_active is not None and my_active.id == Charcadet
+            soubureizu_on_bench = any(p is not None and p.id == Soubureizu_ex for p in my_state.bench)
+            if active_is_charcadet and soubureizu_on_bench:
+                score = 5000  # ソウブレイズexをバトル場に出すため最優先で退場
+            elif plan.attacker >= 1:
+                score = 2000
+            else:
+                score = -1
 
         elif o.type == OptionType.ATTACK:
             score = 1000
