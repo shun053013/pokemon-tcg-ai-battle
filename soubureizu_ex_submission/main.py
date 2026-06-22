@@ -31,24 +31,26 @@ all_card = all_card_data()
 card_table = {c.cardId: c for c in all_card}
 
 # Decklist
-Charcadet      = 319   # カルボウ
-Soubureizu_ex  = 320   # ソウブレイズex
-Fire_Energy    = 2     # 基本炎エネルギー
+Charcadet       = 319   # カルボウ
+Soubureizu_ex   = 320   # ソウブレイズex
+Fire_Energy     = 2     # 基本炎エネルギー
+Mist_Energy     = 11    # ミストエネルギー（無色+相手ワザ効果無効）
 
-Hyperball      = 1121  # ハイパーボール
-Poke_Pad       = 1152  # ポケパッド
+Hyperball       = 1121  # ハイパーボール
+Poke_Pad        = 1152  # ポケパッド
 Night_Stretcher = 1097  # 夜のタンカ
-Poke_Poffin    = 1086  # なかよしポフィン
-Perfect_Mixer  = 1128  # パーフェクトミキサー
+Poke_Poffin     = 1086  # なかよしポフィン
+Perfect_Mixer   = 1128  # パーフェクトミキサー
 
-Boss_Orders    = 1182  # ボスの指令
-Lillie         = 1227  # リーリエの決心
-Zeigh          = 1192  # ゼイユ
-Explorer       = 1185  # 探検家の先導
-Pyur           = 1239  # ピュール（任意枚手札トラッシュ→手札5枚になるよう引く）
+Lillie          = 1227  # リーリエの決心
+Zeigh           = 1192  # ゼイユ
+Explorer        = 1185  # 探検家の先導
+Judgeman        = 1213  # ジャッジマン（おたがい手札を戻して4枚引く）
 
-# ピュールでトラッシュしたいグッズ（ポケモン展開用、夜のタンカは除く）
-PYUR_DISCARD_GOODS = (Poke_Poffin, Hyperball, Poke_Pad, Perfect_Mixer)
+# ケーシィ・ユンゲラー・フーディン（ミストエネ最優先付与のトリガー）
+ABRA_ALAKAZAM_LINE = {109, 741, 742, 245, 743}
+
+TOTAL_FIRE = 19  # デッキ内の炎エネルギー総数
 
 # Precompute attack IDs for Soubureizu ex
 _atk_id = {a.name: a.attackId for a in all_attack()}
@@ -159,21 +161,29 @@ def agent(obs_dict: dict) -> list[int]:
     bench_not_setup = (field_counts[Charcadet] + field_counts[Soubureizu_ex]) < 3
     need_draw = bench_not_setup or hand_counts[Fire_Energy] == 0
 
+    # 山札切れ防止: 残り4枚以下ではドロー・サーチ系カードを使用しない
+    deck_low = my_state.deckCount <= 4
+
     my_active  = my_state.active[0] if my_state.active else None
     op_active  = op_state.active[0] if op_state.active else None
     my_cards   = ([my_active] if my_active is not None else []) + [p for p in my_state.bench if p is not None]
     op_cards   = ([op_active] if op_active is not None else []) + [p for p in op_state.bench  if p is not None]
+
+    # 相手の場・ベンチにケーシィ・ユンゲラー・フーディンがいるか
+    op_has_abra_line = any(p is not None and p.id in ABRA_ALAKAZAM_LINE for p in op_cards)
+
+    # 手札+山札にアクセスできる炎エネルギー枚数（0になるとしんえんほむら不可）
+    attached_fire   = sum(sum(1 for e in p.energies if e == EnergyType.FIRE) for p in my_cards)
+    fire_in_deck    = max(0, TOTAL_FIRE - discard_counts[Fire_Energy]
+                             - hand_counts[Fire_Energy] - attached_fire)
+    fire_accessible = hand_counts[Fire_Energy] + fire_in_deck
 
     # Compute attack plan in MAIN context
     if context == SelectContext.MAIN and state.turn >= 2:
         can_switch    = False
         can_op_switch = False
         for o in select.option:
-            if o.type == OptionType.PLAY:
-                card = get_card(obs, AreaType.HAND, o.index, my_index)
-                if card.id == Boss_Orders:
-                    can_op_switch = True
-            elif o.type == OptionType.RETREAT:
+            if o.type == OptionType.RETREAT:
                 can_switch = True
 
         best_score = -1
@@ -191,7 +201,11 @@ def agent(obs_dict: dict) -> list[int]:
             ec = energy_count
             more_energy = False
             if ec < energy_required:
-                if hand_counts[Fire_Energy] >= 1 and not state.energyAttached:
+                can_get_fire = (
+                    hand_counts[Fire_Energy] >= 1 or
+                    (hand_counts[Night_Stretcher] >= 1 and discard_counts[Fire_Energy] >= 1)
+                )
+                if can_get_fire and not state.energyAttached:
                     ec += 1
                     more_energy = True
                 else:
@@ -251,7 +265,7 @@ def agent(obs_dict: dict) -> list[int]:
                         plan.energy       = ec_now < 1
 
     # Energy attachment priority score
-    def energy_score(pokemon: Pokemon, active: bool) -> int:
+    def energy_score(energy_id: int | None, pokemon: Pokemon, active: bool) -> int:
         count = len(pokemon.energies)
         soubureizu_on_bench = any(p is not None and p.id == Soubureizu_ex for p in my_state.bench)
         active_is_charcadet = my_active is not None and my_active.id == Charcadet
@@ -262,11 +276,21 @@ def agent(obs_dict: dict) -> list[int]:
             can_evolve = hand_counts[Soubureizu_ex] > 0
             return 8800 if not can_evolve else 3000
 
-        # ソウブレイズexはエネルギー1枚だけ（しんえんほむらに必要な最小限）
+        # ソウブレイズex
         if pokemon.id == Soubureizu_ex:
-            if count >= 1:
-                return 50   # すでに1枚あるので追加しない
-            return 8000 + (10 if active else 0)
+            fire_count = sum(1 for e in pokemon.energies if e == EnergyType.FIRE)
+            mist_count = sum(1 for c in pokemon.energyCards if c.id == Mist_Energy)
+
+            # ミストエネルギー: 相手にケーシィラインがいれば最優先で付ける
+            if energy_id == Mist_Energy and mist_count == 0 and op_has_abra_line:
+                # 炎エネ付き（攻撃可能）→ 最高優先、炎エネなし→ 炎エネ付与(8010)より低め
+                return 10500 if fire_count >= 1 else 7900
+
+            if fire_count >= 1:
+                return 50   # 炎エネあり、追加不要
+            if energy_id == Fire_Energy:
+                return 8010 + (10 if active else 0)
+            return 200
 
         if pokemon.id == Charcadet:
             return 1000
@@ -316,36 +340,46 @@ def agent(obs_dict: dict) -> list[int]:
                     elif card.id == Soubureizu_ex:
                         score += 80 if field_counts[Soubureizu_ex] < 1 else -100
                     elif card.id == Fire_Energy:
-                        score -= 100  # keep fire energy in discard for damage boost
-                    elif card.id in (Boss_Orders, Zeigh, Lillie, Explorer, Poke_Pad):
+                        is_tanker = select.effect is not None and select.effect.id == Night_Stretcher
+                        soubureizu_needs_fire = (
+                            is_tanker and field_counts[Soubureizu_ex] >= 1 and all(
+                                sum(1 for e in p.energies if e == EnergyType.FIRE) == 0
+                                for p in my_cards if p.id == Soubureizu_ex
+                            )
+                        )
+                        if soubureizu_needs_fire:
+                            score += 300  # 夜のタンカで攻撃用炎エネを優先取得
+                        else:
+                            score -= 100  # 通常はトラッシュに残す
+                    elif card.id == Mist_Energy:
+                        score += 50 if op_has_abra_line else -50
+                    elif card.id in (Zeigh, Lillie, Explorer, Poke_Pad, Judgeman):
                         score += 30
 
                 elif context == SelectContext.ATTACH_FROM:
-                    score = energy_score(card, o.area == AreaType.ACTIVE)
+                    score = energy_score(None, card, o.area == AreaType.ACTIVE)
 
                 elif context in (SelectContext.TO_BENCH, SelectContext.TO_FIELD):
                     score = 100 if card.id == Charcadet else 80 if card.id == Soubureizu_ex else 10
 
                 elif context == SelectContext.DISCARD:
                     if o.area == AreaType.DECK:
-                        # Perfect Mixer: 炎エネルギーのみトラッシュ、それ以外はデッキに戻す
-                        score = 200 if card.id == Fire_Energy else -200
-                    else:
-                        is_pyur = select.effect is not None and select.effect.id == Pyur
+                        # Perfect Mixer: 炎エネ優先（残2以下は保護）、ミストエネは保護
                         if card.id == Fire_Energy:
-                            score = 200
+                            score = 200 if fire_accessible >= 3 else -200
+                        else:
+                            score = -200
+                    else:
+                        if card.id == Fire_Energy:
+                            score = 150 if fire_accessible >= 2 else -200
+                        elif card.id == Mist_Energy:
+                            score = -150  # ミストエネはコストにしない
                         elif card.id in (Charcadet, Soubureizu_ex):
                             score = -100
                         elif card.id in (Explorer, Night_Stretcher):
                             score = -50
-                        elif card.id == Boss_Orders:
-                            score = -30
-                        elif card.id in (Lillie, Zeigh, Pyur):
-                            # ベンチ未展開またはエネルギーが手札にない場合はドロー系サポートを温存
+                        elif card.id in (Lillie, Zeigh, Judgeman):
                             score = -100 if need_draw else 50
-                        elif is_pyur and card.id in PYUR_DISCARD_GOODS:
-                            # ピュール: 展開用グッズを炎エネに次いで優先トラッシュ
-                            score = 150
                         else:
                             score = 50
 
@@ -366,6 +400,13 @@ def agent(obs_dict: dict) -> list[int]:
                 elif context in (SelectContext.TO_DECK, SelectContext.TO_DECK_ENERGY):
                     score = -100 if card.id == Fire_Energy else 100
 
+                elif context in (SelectContext.DISCARD_ENERGY, SelectContext.DISCARD_ENERGY_CARD):
+                    # 逃げるコスト: 炎エネ最優先（枚数が多いためトラッシュに送ってOK）
+                    if card.id == Fire_Energy:
+                        score = 200
+                    else:
+                        score = 100
+
                 elif context in (SelectContext.DAMAGE_COUNTER, SelectContext.DAMAGE_COUNTER_ANY):
                     score = 100
 
@@ -383,33 +424,56 @@ def agent(obs_dict: dict) -> list[int]:
                 if card.id == Poke_Poffin:
                     charcadet_field = field_counts[Charcadet] + field_counts[Soubureizu_ex]
                     bench_full = len(my_state.bench) >= my_state.benchMax
-                    score = 9500 if not bench_full and charcadet_field < 4 else -1
+                    if deck_low:
+                        score = -1
+                    else:
+                        score = 9500 if not bench_full and charcadet_field < 4 else -1
                 elif card.id == Hyperball:
-                    score = 8500 if len(my_state.hand) >= 3 and field_counts[Soubureizu_ex] < 2 else -1
+                    if deck_low:
+                        score = -1
+                    else:
+                        score = 8500 if len(my_state.hand) >= 3 and field_counts[Soubureizu_ex] < 2 else -1
                 elif card.id == Poke_Pad:
-                    score = 8000 if not (field_counts[Charcadet] >= 1 or hand_counts[Charcadet] >= 1) else -1
+                    if deck_low:
+                        score = -1
+                    else:
+                        score = 8000 if not (field_counts[Charcadet] >= 1 or hand_counts[Charcadet] >= 1) else -1
                 elif card.id == Night_Stretcher:
-                    has_trash = any(c.id in (Charcadet, Soubureizu_ex) for c in my_state.discard)
-                    score = 7000 if has_trash else -1
+                    # 夜のタンカはトラッシュ回収なので山札を消費しない → deck_low 制限なし
+                    has_pokemon_trash = any(c.id in (Charcadet, Soubureizu_ex) for c in my_state.discard)
+                    active_soubureizu_no_fire = (
+                        my_active is not None and
+                        my_active.id == Soubureizu_ex and
+                        sum(1 for e in my_active.energies if e == EnergyType.FIRE) == 0 and
+                        discard_counts[Fire_Energy] >= 1
+                    )
+                    if active_soubureizu_no_fire:
+                        score = 8900
+                    elif has_pokemon_trash:
+                        score = 7000
+                    else:
+                        score = -1
                 elif card.id == Perfect_Mixer:
-                    score = 9900 if my_state.deckCount >= 1 else -1
-                elif card.id == Boss_Orders:
-                    score = 3200 if plan.target >= 1 else -1
+                    score = -1 if deck_low else (9900 if my_state.deckCount >= 1 else -1)
                 elif card.id == Explorer:
-                    score = 3100
-                elif card.id == Pyur:
-                    # 炎エネルギーが多いほど高優先度（捨てて手札補充）
-                    if hand_counts[Fire_Energy] >= 2:
-                        score = 2800
-                    elif hand_counts[Fire_Energy] >= 1 or sum(1 for c in my_state.hand if c.id in PYUR_DISCARD_GOODS) >= 2:
-                        score = 2500
+                    score = -1 if deck_low else 3100
+                elif card.id == Judgeman:
+                    if deck_low:
+                        score = -1
+                    elif len(op_state.hand) > 8:
+                        score = 3300
                     else:
                         score = 2000
                 elif card.id == Lillie:
-                    score = 3000 if len(my_state.hand) <= 4 else 1000
+                    if deck_low:
+                        score = -1
+                    else:
+                        score = 3000 if len(my_state.hand) <= 4 else 1000
                 elif card.id == Zeigh:
                     is_first_turn = state.turn == 1 and state.firstPlayer == my_index
-                    if is_first_turn:
+                    if deck_low:
+                        score = -1
+                    elif is_first_turn:
                         score = 3500
                     elif hand_counts[Fire_Energy] >= 3:
                         score = 2500
@@ -419,8 +483,10 @@ def agent(obs_dict: dict) -> list[int]:
                         score = 1500
 
         elif o.type == OptionType.ATTACH:
-            pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
-            score   = energy_score(pokemon, o.inPlayArea == AreaType.ACTIVE)
+            energy_card = get_card(obs, o.area, o.index, my_index)
+            pokemon     = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
+            eid         = energy_card.id if energy_card else None
+            score       = energy_score(eid, pokemon, o.inPlayArea == AreaType.ACTIVE)
             if o.inPlayArea == AreaType.ACTIVE and plan.attacker == 0 and plan.energy:
                 score += 200
             elif o.inPlayArea == AreaType.BENCH and plan.attacker == 1 + o.inPlayIndex and plan.energy:
