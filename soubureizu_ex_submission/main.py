@@ -431,8 +431,12 @@ def agent(obs_dict: dict) -> list[int]:
                 elif card.id == Hyperball:
                     if deck_low:
                         score = -1
+                    elif field_counts[Soubureizu_ex] >= 1:
+                        score = -1  # 1体でもいれば無理して使わない
+                    elif len(my_state.hand) >= 3:
+                        score = 8500
                     else:
-                        score = 8500 if len(my_state.hand) >= 3 and field_counts[Soubureizu_ex] < 2 else -1
+                        score = -1
                 elif card.id == Poke_Pad:
                     if deck_low:
                         score = -1
@@ -445,6 +449,7 @@ def agent(obs_dict: dict) -> list[int]:
                         my_active is not None and
                         my_active.id == Soubureizu_ex and
                         sum(1 for e in my_active.energies if e == EnergyType.FIRE) == 0 and
+                        hand_counts[Fire_Energy] == 0 and  # 手札に炎エネがない場合のみ（あれば直接つければいい）
                         discard_counts[Fire_Energy] >= 1
                     )
                     if active_soubureizu_no_fire:
