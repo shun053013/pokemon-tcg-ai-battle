@@ -460,7 +460,7 @@ def agent(obs_dict: dict) -> list[int]:
                 elif card.id == Judgeman:
                     if deck_low:
                         score = -1
-                    elif len(op_state.hand) > 8:
+                    elif op_state.handCount > 8:
                         score = 3300
                     else:
                         score = 2000
