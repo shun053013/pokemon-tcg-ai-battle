@@ -162,6 +162,16 @@ def agent(obs_dict: dict) -> list[int]:
     # 相手の場・ベンチにケーシィ・ユンゲラー・フーディンがいるか
     op_has_abra_line = any(p is not None and p.id in ABRA_ALAKAZAM_LINE for p in op_cards)
 
+    # 手札+山札にアクセスできる炎エネルギー枚数（0になるとしんえんほむら不可）
+    TOTAL_FIRE = 6  # デッキ内の炎エネルギー総数
+    attached_fire = sum(
+        sum(1 for e in p.energies if e == EnergyType.FIRE)
+        for p in my_cards
+    )
+    fire_in_deck   = max(0, TOTAL_FIRE - discard_counts[Fire_Energy]
+                            - hand_counts[Fire_Energy] - attached_fire)
+    fire_accessible = hand_counts[Fire_Energy] + fire_in_deck
+
     # ─── Attack plan ──────────────────────────────────────────
     if context == SelectContext.MAIN and state.turn >= 2:
         can_switch    = False
@@ -445,11 +455,12 @@ def agent(obs_dict: dict) -> list[int]:
 
                 elif context == SelectContext.DISCARD:
                     if o.area == AreaType.DECK:
-                        # Perfect Mixer / モグリューのほりまくり: 炎エネ・闘エネをトラッシュ
-                        if card.id == Fire_Energy:
+                        # Perfect Mixer / モグリューのほりまくり: 闘エネ優先、炎エネは残2枚以下なら保護
+                        if card.id == Fighting_Energy:
                             score = 200
-                        elif card.id == Fighting_Energy:
-                            score = 200
+                        elif card.id == Fire_Energy:
+                            # 複数枚同時に表示される可能性があるため余裕を持たせる
+                            score = 200 if fire_accessible >= 3 else -200
                         else:
                             score = -200
                     else:
@@ -457,10 +468,13 @@ def agent(obs_dict: dict) -> list[int]:
                         if is_lunacycle:
                             # ルナサイクル: 闘エネルギーをトラッシュ
                             score = 200 if card.id == Fighting_Energy else -100
-                        elif card.id == Fire_Energy:
-                            score = 200
                         elif card.id == Fighting_Energy:
-                            score = 180  # 炎エネに次いで捨てても良い
+                            score = 200  # 最優先でトラッシュ
+                        elif card.id == Mist_Energy:
+                            score = 190  # 次に優先
+                        elif card.id == Fire_Energy:
+                            # 手札+山札の炎エネが1以下なら絶対に温存
+                            score = 150 if fire_accessible >= 2 else -200
                         elif card.id in (Charcadet, Soubureizu_ex, Solrock, Lunatone):
                             score = -100
                         elif card.id in (Explorer, Night_Stretcher):
@@ -487,6 +501,17 @@ def agent(obs_dict: dict) -> list[int]:
 
                 elif context in (SelectContext.TO_DECK, SelectContext.TO_DECK_ENERGY):
                     score = -100 if card.id in (Fire_Energy, Fighting_Energy) else 100
+
+                elif context in (SelectContext.DISCARD_ENERGY, SelectContext.DISCARD_ENERGY_CARD):
+                    # 逃げるコストのエネルギー選択: 闘エネ・ミストエネ優先、炎エネは最後の手段
+                    if card.id == Fighting_Energy:
+                        score = 200
+                    elif card.id == Mist_Energy:
+                        score = 190
+                    elif card.id == Fire_Energy:
+                        score = 10   # 他に選択肢がなければ使う
+                    else:
+                        score = 100
 
                 elif context in (SelectContext.DAMAGE_COUNTER, SelectContext.DAMAGE_COUNTER_ANY):
                     score = 100
