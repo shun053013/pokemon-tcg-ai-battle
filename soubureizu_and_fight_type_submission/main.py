@@ -1,3 +1,4 @@
+%%writefile main.py
 import os
 import sys
 from collections import defaultdict
@@ -223,7 +224,11 @@ def agent(obs_dict: dict) -> list[int]:
                 fire_ec     = sum(1 for e in my_pokemon.energies if e == EnergyType.FIRE)
                 more_energy = False
                 if fire_ec < 1:
-                    if hand_counts[Fire_Energy] >= 1 and not state.energyAttached:
+                    can_get_fire = (
+                        hand_counts[Fire_Energy] >= 1 or
+                        (hand_counts[Night_Stretcher] >= 1 and discard_counts[Fire_Energy] >= 1)
+                    )
+                    if can_get_fire and not state.energyAttached:
                         fire_ec     += 1
                         more_energy  = True
                     else:
@@ -260,7 +265,12 @@ def agent(obs_dict: dict) -> list[int]:
                 can_still_attack = fc >= 1 or (hand_counts[Fighting_Energy] >= 1 and not state.energyAttached)
             elif my_att and my_att.id == Soubureizu_ex:
                 fc = sum(1 for e in my_att.energies if e == EnergyType.FIRE)
-                can_still_attack = fc >= 1 or (hand_counts[Fire_Energy] >= 1 and not state.energyAttached)
+                can_still_attack = fc >= 1 or (
+                    not state.energyAttached and (
+                        hand_counts[Fire_Energy] >= 1 or
+                        (hand_counts[Night_Stretcher] >= 1 and discard_counts[Fire_Energy] >= 1)
+                    )
+                )
 
             if can_still_attack:
                 for j, op_pokemon in enumerate(op_cards):
@@ -406,7 +416,14 @@ def agent(obs_dict: dict) -> list[int]:
                     elif card.id == Soubureizu_ex:
                         score += 80 if field_counts[Soubureizu_ex] < 1 else -100
                     elif card.id == Fire_Energy:
-                        score -= 100  # 炎エネはトラッシュに残してダメージUP
+                        is_tanker = select.effect is not None and select.effect.id == Night_Stretcher
+                        if is_tanker and field_counts[Soubureizu_ex] >= 1 and all(
+                            sum(1 for e in p.energies if e == EnergyType.FIRE) == 0
+                            for p in my_cards if p.id == Soubureizu_ex
+                        ):
+                            score += 300  # 夜のタンカで攻撃用炎エネを優先取得 (200+300=500)
+                        else:
+                            score -= 100  # 通常時はトラッシュに残す
                     elif card.id == Fighting_Energy:
                         score += 20   # ルナサイクル・ソルロック攻撃に必要
                     elif card.id in (Boss_Orders, Zeigh, Lillie, Explorer, Poke_Pad):
@@ -531,22 +548,46 @@ def agent(obs_dict: dict) -> list[int]:
                         score = -1
 
                 elif card.id == Night_Stretcher:
-                    has_trash = any(c.id in (Charcadet, Soubureizu_ex, Solrock, Lunatone)
-                                    for c in my_state.discard)
-                    score = 7000 if has_trash else -1
+                    has_pokemon_trash = any(c.id in (Charcadet, Soubureizu_ex, Solrock, Lunatone)
+                                            for c in my_state.discard)
+                    active_soubureizu_no_fire = (
+                        my_active is not None and
+                        my_active.id == Soubureizu_ex and
+                        sum(1 for e in my_active.energies if e == EnergyType.FIRE) == 0 and
+                        discard_counts[Fire_Energy] >= 1
+                    )
+                    if active_soubureizu_no_fire:
+                        score = 8900  # 攻撃を通すためにトラッシュから炎エネを最優先回収
+                    elif has_pokemon_trash:
+                        score = 7000
+                    else:
+                        score = -1
 
                 elif card.id == Boss_Orders:
                     score = 3200 if plan.target >= 1 else -1
 
                 elif card.id == Explorer:
-                    score = 3100
+                    # 上6枚を見て4枚トラッシュ+2枚取得 → 残り3枚確保: deck < 9 なら禁止
+                    if my_state.deckCount < 9:
+                        score = -1
+                    else:
+                        score = 3100
 
                 elif card.id == Lillie:
-                    score = 3000 if len(my_state.hand) <= 4 else 1000
+                    # 手札を山札に戻してから6枚引く → 残り3枚確保: (deck + hand) < 9 なら禁止
+                    if (my_state.deckCount + len(my_state.hand)) < 9:
+                        score = -1
+                    elif len(my_state.hand) <= 4:
+                        score = 3000
+                    else:
+                        score = 1000
 
                 elif card.id == Zeigh:
                     is_first_turn = state.turn == 1 and state.firstPlayer == my_index
-                    if is_first_turn:
+                    # 5枚引く → 残り3枚確保: deck < 8 なら禁止
+                    if my_state.deckCount < 8:
+                        score = -1
+                    elif is_first_turn:
                         score = 3500
                     elif hand_counts[Fighting_Energy] >= 3:
                         score = 2500  # 闘エネを大量にトラッシュできる
@@ -584,16 +625,10 @@ def agent(obs_dict: dict) -> list[int]:
                     for p in ([my_active] if my_active else []) + list(my_state.bench)
                 )
                 if solrock_on_field and hand_counts[Fighting_Energy] >= 1:
-                    # バトル場のソルロックにエネルギーがなく闘エネが1枚だけ → 攻撃優先でエネルギーを温存
-                    solrock_active_no_energy = (
-                        my_active is not None and
-                        my_active.id == Solrock and
-                        sum(1 for e in my_active.energies if e == EnergyType.FIGHTING) == 0
-                    )
-                    if solrock_active_no_energy and hand_counts[Fighting_Energy] == 1:
-                        score = -1  # エネルギー付与を優先するためルナサイクルは使わない
+                    if my_state.deckCount < 6:  # 3枚引く → 残り3枚以上確保
+                        score = -1
                     else:
-                        score = 9800  # それ以外は必ず使用
+                        score = 9800
                 else:
                     score = -1
             elif card is not None and card.id in (Mogurew, Kitchigisu_ex):
